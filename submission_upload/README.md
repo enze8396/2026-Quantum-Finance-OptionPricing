@@ -1,6 +1,6 @@
 # 2026-Quantum-Finance-OptionPricing
 
-2026 年 CIC“悟空杯”量子金融赛项提交版本。
+2026 年 CIC“悟空杯”量子金融赛项。
 
 ## 核心交付物
 

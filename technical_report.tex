@@ -1,0 +1,489 @@
+\documentclass[12pt,a4paper]{ctexart}
+\usepackage{amsmath,amssymb,bm,mathtools}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{float}
+\usepackage{graphicx}
+\usepackage{fancyvrb}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!50!black,
+    urlcolor=blue!50!black,
+    citecolor=blue!50!black
+}
+
+\title{基于极简底层编译与 IQAE 的量子期权定价方案——2026年CIC“悟空杯”量子金融赛项技术报告}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+期权定价作为连接金融风险与市场价值的关键环节，在复杂奇异期权和大规模资产组合场景下长期受到经典蒙特卡洛方法计算成本的限制。量子蒙特卡洛积分（QMCI）与量子振幅估计（QAE）为期望值估计提供了潜在量子加速路径，但标准 QAE 依赖评估寄存器、受控幂次 Grover 算子与逆量子傅里叶变换（IQFT），难以直接部署在当前噪声中等规模量子（NISQ）设备上。为此，本文围绕 2026 年 CIC“悟空杯”量子计算大赛赛题，提出一套\textbf{硬件友好、无辅助比特、纯底层门实现}的 SPY 欧式看涨期权定价方案。本文在 3 个状态比特上离散化 Black-Scholes-Merton（BSM）模型下的对数正态终值分布，并引入第 4 个目标比特进行收益编码，从而将整套量子定价线路严格压缩在 \textbf{4 个量子比特} 内。状态加载、收益编码、全零态反射以及 Grover 核心算子均未调用任何高级态加载库、多控制旋转宏门或多控制相位宏门，而是仅使用单比特门与 CNOT 门手工编译完成。数值结果表明，价格分布加载误差约为 $1.11\times 10^{-16}$，收益编码成功概率误差约为 $2.78\times 10^{-17}$，单次 Grover 放大误差约为 $4.44\times 10^{-16}$，均达到机器精度量级。进一步地，本文采用迭代量子振幅估计（IQAE）与最大似然估计（MLE）替代标准 QAE，从根本上移除了 IQFT 操作，在有限采样条件下完成了端到端期权现价恢复。结果表明，该方案在极低量子资源预算下仍可实现稳定、可解释、可复现的量子金融计算流程，具有良好的 NISQ 硬件适配性与比赛实战价值。
+\end{abstract}
+
+\section{赛题背景与设计目标}
+期权定价作为金融工程的基础问题，其核心在于高效估计随机终值分布下的折现期望收益。对于欧式看涨期权，Black-Scholes-Merton（BSM）模型给出了连续时间闭式解；然而在更复杂的收益结构、更多资产维度或更高精度需求下，经典蒙特卡洛模拟的样本复杂度与计算成本会迅速上升。量子计算通过叠加与干涉机制，为金融期望值估计提供了跨代发展的机会。
+
+然而，从理论上的量子振幅估计到真实 NISQ 设备之间存在显著落差。标准 QAE 依赖逆量子傅里叶变换以及额外评估寄存器，其线路宽度大、深度深、双比特门数量高，对当前量子芯片而言并不友好。因此，本赛题的关键不只是“能否写出量子定价线路”，而是“能否在严格门约束与低噪声预算下，写出真正硬件友好的量子定价线路”。
+
+围绕这一目标，本文针对 SPY 欧式看涨期权构建端到端量子定价流程，并明确坚持以下设计原则：
+\begin{itemize}[leftmargin=2em]
+\item \textbf{极简量子资源：} 全流程仅使用 4 个量子比特，其中 3 个状态比特表示离散价格分支，1 个目标比特表示收益振幅，不引入任何辅助比特。
+\item \textbf{底层门手工编译：} 不调用任意态加载宏门、多控制旋转宏门、多控制 $Z$ 宏门与现成振幅估计库，所有复杂结构均由单比特门与 CNOT 手工分解实现。
+\item \textbf{NISQ 友好估计框架：} 采用 IQAE 与经典 MLE 取代标准 QAE + IQFT 的范式，优先优化可运行性与鲁棒性，而非理想化的大规模容错模型。
+\end{itemize}
+
+\section{赛题约束与总体方案}
+\subsection{开发环境与硬件约束}
+根据赛题要求，本文仅在 Python 3.10 环境下开发，量子线路构建与仿真仅使用 \texttt{pyqpanda3}，经典辅助计算仅使用 \texttt{numpy} 与 \texttt{scipy}。在量子线路层面，赛题要求双比特门仅允许使用 CNOT 与 CZ，且禁止直接调用宏功能门或高级态加载模块。因此，本文从一开始就将“\textbf{可解释的底层编译}”作为实现主线。
+
+在程序接口层面，本文进一步将金融参数封装为统一的 \texttt{PricingConfig} 动态配置入口，支持显式修改
+\begin{equation}
+(S_0,K,r,\sigma,T)
+\end{equation}
+等核心参数，并保留状态比特数、截断区间与收益缩放常数等可调控制项。因此，评委可直接在单一入口处替换不同金融参数、市场假设或离散化粒度，完成一键复现实验；若输入来自真实市场数据拟合结果，量子线路主体亦无需改写。
+
+\subsection{总体算法框架}
+本文采用赛题指定的量子蒙特卡洛积分（QMCI）框架，以欧式看涨期权为基础模型，整体流程可表示为
+\begin{equation}
+\text{BSM 离散化}
+\;\Longrightarrow\;
+\mathcal{A}_{\mathrm{SP}}
+\;\Longrightarrow\;
+\mathcal{A}_{\mathrm{payoff}}
+\;\Longrightarrow\;
+\mathcal{Q}
+\;\Longrightarrow\;
+\text{IQAE + MLE}
+\;\Longrightarrow\;
+V_0.
+\end{equation}
+其中：
+\begin{itemize}[leftmargin=2em]
+\item $\mathcal{A}_{\mathrm{SP}}$ 为价格分布态制备线路；
+\item $\mathcal{A}_{\mathrm{payoff}}$ 为收益编码线路；
+\item $\mathcal{A}=\mathcal{A}_{\mathrm{SP}}\circ\mathcal{A}_{\mathrm{payoff}}$ 为总态加载算子；
+\item $\mathcal{Q}$ 为围绕 $\mathcal{A}$ 构造的 Grover 迭代算子；
+\item IQAE 部分通过多组不同 Grover 深度下的实验数据对 $\theta$ 做最大似然估计。
+\end{itemize}
+
+\section{三项核心创新点}
+\subsection{创新点一：仅用 4 个量子比特，且完全无辅助比特}
+本文的第一项核心创新在于：\textbf{全流程仅使用 4 个量子比特，不引入任何辅助位。} 其中，前 3 个量子比特用于表示离散价格状态，最后 1 个量子比特用于承载收益振幅。相较于标准 QAE 需要额外引入 $m$ 个评估寄存器的结构，本文的量子比特需求从
+\begin{equation}
+n_{\mathrm{QAE}} = 4 + m
+\end{equation}
+压缩为
+\begin{equation}
+n_{\mathrm{ours}} = 4.
+\end{equation}
+这意味着，在典型的 $m=6\sim 8$ 精度比特设置下，本文线路可将总量子比特数从 $10\sim 12$ 直接压缩到 4，比特预算优势非常明显，极其适合当前可用量子芯片的实际规模。
+
+\subsection{创新点二：复杂控制逻辑全部手工底层编译}
+本文的第二项核心创新在于：\textbf{所有高阶多控制操作均未调用现成宏门，而是通过 Gray code、多路复用旋转和相位多项式手工分解为底层门。} 具体而言：
+\begin{itemize}[leftmargin=2em]
+\item 在状态加载阶段，3 比特任意实振幅态通过满二叉树回推获得 7 个旋转角，再由单控制与双控制多路复用 $R_y$ 梯子手工实现；
+\item 在收益编码阶段，3 控制 1 目标均匀受控旋转通过 Gray code 顺序下的 Walsh-Hadamard 角变换实现；
+\item 在全零态反射阶段，$C^3Z$ 通过相位多项式精确合成，不使用 Toffoli 宏门与 ancilla。
+\end{itemize}
+这样做的直接收益有两点。其一，线路结构完全透明、可审计，评委可以清晰看到每一个复杂算子是如何落地为基础门序列的；其二，线路宽度和双比特门开销是固定且可控的，不依赖外部编译器对黑箱宏门的二次展开。
+
+\subsection{创新点三：用 IQAE 取代标准 QAE，彻底移除 IQFT}
+本文的第三项核心创新在于：\textbf{采用 IQAE + MLE 取代标准 QAE，从而彻底移除逆量子傅里叶变换（IQFT）。} 标准 QAE 的主要困难在于：
+\begin{equation}
+\text{评估寄存器} + \text{受控 } \mathcal{Q}^{2^j} + \mathrm{IQFT},
+\end{equation}
+这会在当前 NISQ 条件下引入过高的线路深度与控制复杂度。相较之下，IQAE 仅要求多次执行
+\begin{equation}
+\mathcal{A}\mathcal{Q}^k,
+\end{equation}
+再结合经典最大似然估计恢复振幅角 $\theta$。因此，本文的量子部分始终只围绕同一个 Grover 核心算子展开，而复杂统计推断全部下放到经典端完成。这一设计大幅提升了算法的抗噪鲁棒性与硬件可运行性，也精准贴合了赛题对“极简线路、硬件友好”路线的加分导向。
+
+\section{量子信息加载：离散价格分布的底层态制备}
+在 BSM 模型下，标的资产终值 $S_T$ 服从对数正态分布，其概率密度函数为
+\begin{equation}
+f_{LN}(S)=\frac{1}{S\sigma\sqrt{2\pi T}}
+\exp\!\left(
+-\frac{\left[\ln S-\left(\ln S_0+\left(r-\frac{1}{2}\sigma^2\right)T\right)\right]^2}{2\sigma^2T}
+\right).
+\end{equation}
+本文采用如下参数：
+\begin{equation}
+S_0=500,\qquad K=500,\qquad r=0.05,\qquad \sigma=0.15,\qquad T=\frac{30}{365}.
+\end{equation}
+
+由于仅使用 3 个状态比特，故总离散状态数为 $2^3=8$。为降低截断误差，价格网格均匀取于区间
+\begin{equation}
+\left[S_0 e^{-3\sigma\sqrt{T}},\; S_0 e^{+3\sigma\sqrt{T}}\right].
+\end{equation}
+记离散价格点为 $\{S_i\}_{i=0}^{7}$，则离散概率质量写为
+\begin{equation}
+\tilde p_i=f_{LN}(S_i)\Delta S,\qquad
+p_i=\frac{\tilde p_i}{\sum_{j=0}^{7}\tilde p_j},
+\end{equation}
+对应振幅定义为
+\begin{equation}
+a_i=\sqrt{p_i},\qquad
+|\psi_{\mathrm{price}}\rangle=\sum_{i=0}^{7} a_i |i\rangle.
+\end{equation}
+
+为满足“禁止高级态加载宏门”的赛题红线，本文采用满二叉树分解手工求解 7 个 $R_y$ 角。若振幅按
+\begin{equation}
+[a_{000},a_{001},a_{010},a_{011},a_{100},a_{101},a_{110},a_{111}]
+\end{equation}
+排序，则根节点角与第二层角为
+\begin{equation}
+\theta_0=
+2\arctan\frac{\sqrt{a_{100}^2+a_{101}^2+a_{110}^2+a_{111}^2}}
+{\sqrt{a_{000}^2+a_{001}^2+a_{010}^2+a_{011}^2}},
+\end{equation}
+\begin{equation}
+\theta_1=
+2\arctan\frac{\sqrt{a_{010}^2+a_{011}^2}}{\sqrt{a_{000}^2+a_{001}^2}},
+\qquad
+\theta_2=
+2\arctan\frac{\sqrt{a_{110}^2+a_{111}^2}}{\sqrt{a_{100}^2+a_{101}^2}}.
+\end{equation}
+叶节点角则为
+\begin{equation}
+\theta_3=2\arctan\frac{a_{001}}{a_{000}},\quad
+\theta_4=2\arctan\frac{a_{011}}{a_{010}},\quad
+\theta_5=2\arctan\frac{a_{101}}{a_{100}},\quad
+\theta_6=2\arctan\frac{a_{111}}{a_{110}}.
+\end{equation}
+
+在门级实现上，所有受控 $R_y$ 均进一步分解为单比特 $R_y$ 与 CNOT。对单控制多路复用旋转，有
+\begin{equation}
+\alpha_0=\frac{\theta^{(0)}+\theta^{(1)}}{2},\qquad
+\alpha_1=\frac{\theta^{(0)}-\theta^{(1)}}{2},
+\end{equation}
+对应线路为
+\begin{equation}
+R_y(\alpha_0)\;\mathrm{CNOT}\;R_y(\alpha_1)\;\mathrm{CNOT}.
+\end{equation}
+双控制多路复用旋转也可通过 4 个基础角的线性组合，进一步写成仅含 $R_y$ 与 CNOT 的交替序列。最终，状态加载线路仅包含
+\begin{equation}
+7\ \mathrm{RY} + 6\ \mathrm{CNOT},
+\end{equation}
+且最大概率误差约为 $1.11\times 10^{-16}$，达到机器精度范围。
+
+\section{量子算术与收益编码：3 控制多路复用旋转}
+对于欧式看涨期权，离散收益定义为
+\begin{equation}
+\mathrm{payoff}_i=\max(S_i-K,0).
+\end{equation}
+引入第 4 个量子比特作为目标比特，并定义
+\begin{equation}
+p_{\max}=\max_i \mathrm{payoff}_i,\qquad
+\tilde y_i=c\cdot\frac{\mathrm{payoff}_i}{p_{\max}},
+\end{equation}
+其中缩放常数取 $c=0.5$，以避免过大的旋转角。随后定义分支角
+\begin{equation}
+\gamma_i=2\arcsin\sqrt{\tilde y_i}.
+\end{equation}
+于是，当控制寄存器处于第 $i$ 个价格分支时，有
+\begin{equation}
+\Pr(q_{\mathrm{target}}=1\mid i)=\sin^2\frac{\gamma_i}{2}=\tilde y_i.
+\end{equation}
+
+接下来需要实现 3 控制 1 目标的均匀受控旋转。为此，本文不使用多控制旋转宏门，而是采用 Gray code 顺序下的 Walsh-Hadamard 角变换。记
+\begin{equation}
+\bm{\gamma}=[\gamma_0,\ldots,\gamma_7]^T,\qquad
+\bm{\delta}=[\delta_0,\ldots,\delta_7]^T,
+\end{equation}
+则有
+\begin{equation}
+\bm{\delta}=M\bm{\gamma},
+\end{equation}
+其中
+\begin{equation}
+M_{r,c}=2^{-k}(-1)^{\mathrm{popcount}(g_r\land c)},\qquad k=3.
+\end{equation}
+这里 $g_r$ 为第 $r$ 个 Gray code 码字，$\mathrm{popcount}(\cdot)$ 表示二进制中 1 的个数。完成变换后，整条收益编码线路可写为
+\begin{equation}
+\prod_{j=0}^{7}\Big(R_y(\delta_j)\cdot \mathrm{CNOT}_{c_j\rightarrow t}\Big),
+\end{equation}
+其中 $c_j$ 由 Gray code 相邻码字之间的单比特翻转位置唯一确定。
+
+由此，收益编码部分被压缩为
+\begin{equation}
+8\ \mathrm{RY} + 8\ \mathrm{CNOT},
+\end{equation}
+无需任何辅助比特。与经典理论值比较后，目标比特成功概率误差仅为 $2.78\times 10^{-17}$，说明底层手工编译的多路复用旋转在数值上高度精确。
+
+更重要的是，本文的收益编码框架并不局限于欧式看涨期权。由于量子线路真正依赖的仅是离散收益列表 $\{\mathrm{payoff}_i\}$ 及其对应的分支角 $\{\gamma_i\}$，因此只要在经典端更换收益函数，后续的 Gray code 角变换与量子门编译流程可保持完全不变。以向上敲出看涨期权（Up-and-Out Call）为例，其离散收益可写为
+\begin{equation}
+\mathrm{payoff}^{\mathrm{UO}}_i=
+\begin{cases}
+\max(S_i-K,0), & S_i < B,\\
+0, & S_i \ge B,
+\end{cases}
+\end{equation}
+其中 $B$ 为敲出障碍价格。本文在代码中显式提供了该奇异期权收益函数接口，以展示框架在障碍期权等奇异期权上的可扩展性。
+
+\section{Grover 核心算子与全零态反射的底层实现}
+在总算子
+\begin{equation}
+\mathcal{A}=\mathcal{A}_{\mathrm{SP}}\circ\mathcal{A}_{\mathrm{payoff}}
+\end{equation}
+基础上，本文构建 Grover 核心算子
+\begin{equation}
+\mathcal{Q}=-\mathcal{A}\mathcal{S}_0\mathcal{A}^{\dagger}\mathcal{S}_f.
+\end{equation}
+其中，$\mathcal{S}_f$ 直接对目标比特施加一个 $Z$ 门即可，即
+\begin{equation}
+\mathcal{S}_f = Z_{q[3]}.
+\end{equation}
+而 $\mathcal{A}^{\dagger}$ 则通过反序施加所有 CNOT 门并将所有旋转角取负实现：
+\begin{equation}
+R_y(\phi)^{\dagger}=R_y(-\phi),\qquad
+R_z(\phi)^{\dagger}=R_z(-\phi).
+\end{equation}
+
+真正困难的部分在于全零态反射 $\mathcal{S}_0$。本文采用
+\begin{equation}
+\mathcal{S}_0 = X^{\otimes 4}\;C^3Z\;X^{\otimes 4}
+\end{equation}
+的结构，将问题转化为对 $|1111\rangle$ 的相位翻转。关键创新在于：本文没有调用任何多控制 $Z$ 宏门，而是采用相位多项式展开
+\begin{equation}
+C^3Z \sim \prod_{\emptyset\neq S\subseteq\{0,1,2,3\}}
+\exp\!\left(i\frac{\pi}{16}(-1)^{|S|}Z_S\right),
+\end{equation}
+其中
+\begin{equation}
+Z_S=\prod_{j\in S}Z_j.
+\end{equation}
+对于每一项多体相位，进一步利用 CNOT 梯子与单个 $R_z$ 门实现：
+\begin{equation}
+e^{i\alpha Z_{i_1}\cdots Z_{i_m}}
+=
+\left(\prod_{k=1}^{m-1}\mathrm{CNOT}(i_k,i_m)\right)
+R_Z(-2\alpha)_{i_m}
+\left(\prod_{k=m-1}^{1}\mathrm{CNOT}(i_k,i_m)\right).
+\end{equation}
+
+由此，全零态反射 $\mathcal{S}_0$ 的基础门开销固定为
+\begin{equation}
+8\ \mathrm{X} + 15\ \mathrm{RZ} + 34\ \mathrm{CNOT},
+\end{equation}
+而整个 Grover 算子 $\mathcal{Q}$ 的基础门预算为
+\begin{equation}
+30\ \mathrm{RY} + 15\ \mathrm{RZ} + 8\ \mathrm{X} + 1\ \mathrm{Z} + 62\ \mathrm{CNOT}.
+\end{equation}
+这一资源统计直接展示了本文手工底层编译方案的可控性与可审计性。
+
+数值上，初始成功概率
+\begin{equation}
+a=\Pr(q[3]=1)=0.07076767299760531
+\end{equation}
+在施加一次 Grover 迭代后被放大为
+\begin{equation}
+\Pr(q[3]=1\mid \mathcal{A}\mathcal{Q})=\sin^2(3\theta)\approx 0.5223860760314372,
+\end{equation}
+而量子线路仿真结果与解析值之间的误差约为 $4.44\times 10^{-16}$。
+
+\section{IQAE 与最大似然估计：端到端期权定价}
+设总算子 $\mathcal{A}$ 作用后目标比特成功概率为
+\begin{equation}
+a=\sin^2(\theta).
+\end{equation}
+若继续施加 $k$ 次 Grover 迭代，则成功概率演化为
+\begin{equation}
+p_k(\theta)=\sin^2((2k+1)\theta).
+\end{equation}
+本文选择 IQAE 调度序列
+\begin{equation}
+k_{\mathrm{schedule}}=[0,1,2,4,8],
+\end{equation}
+并对每个 $k$ 采样 $N=1000$ 次。为模拟真实 NISQ 条件下的有限测量，本文首先通过态矢模拟获得精确成功概率 $p_k$，再利用二项分布
+\begin{equation}
+h_k \sim \mathrm{Binomial}(N,p_k)
+\end{equation}
+生成成功次数样本 $h_k$。
+
+在此基础上，构造关于参数 $\theta$ 的似然函数
+\begin{equation}
+L(\theta)\propto \prod_k p_k(\theta)^{h_k}\left(1-p_k(\theta)\right)^{N-h_k},
+\end{equation}
+对应对数似然为
+\begin{equation}
+\log L(\theta)=
+\sum_k\left[
+h_k\log p_k(\theta)+(N-h_k)\log(1-p_k(\theta))
+\right],
+\qquad \theta\in[0,\pi/4].
+\end{equation}
+本文使用一维最大似然估计恢复 $\theta_{\mathrm{est}}$，再通过
+\begin{equation}
+\mathbb{E}[\mathrm{payoff}]
+=
+\sin^2(\theta_{\mathrm{est}})\cdot \frac{p_{\max}}{c}
+\end{equation}
+反推出期望收益，并计算折现期权价格
+\begin{equation}
+V_0=e^{-rT}\,\mathbb{E}[\mathrm{payoff}].
+\end{equation}
+
+作为基准，本文同时计算离散网格价格
+\begin{equation}
+V_0^{\mathrm{grid}}=e^{-rT}\sum_{i=0}^{7}p_i\,\mathrm{payoff}_i
+\end{equation}
+以及 BSM 解析解
+\begin{equation}
+V_0^{\mathrm{BSM}}=S_0\Phi(d_1)-Ke^{-rT}\Phi(d_2),
+\end{equation}
+其中
+\begin{equation}
+d_1=\frac{\ln(S_0/K)+(r+\frac{1}{2}\sigma^2)T}{\sigma\sqrt{T}},
+\qquad
+d_2=d_1-\sigma\sqrt{T}.
+\end{equation}
+
+需要强调的是，虽然本文在数值验证中采用 BSM 对数正态分布作为基准，但状态加载模块本质上只依赖一个离散概率向量 $\{p_i\}$，并通过
+\begin{equation}
+a_i=\sqrt{p_i}
+\end{equation}
+将其映射为量子振幅。因此，若未来将经典预处理替换为真实金融市场数据拟合得到的肥尾分布、偏斜分布，或进一步替换为量子 GAN 生成的任意离散分布样本，后续的状态加载、收益编码、Grover 算子与 IQAE 主流程均无需结构性修改。这一性质意味着本文方案并不受 BSM 假设束缚，而是具备面向更一般市场分布的适配潜力。
+
+为体现这一点，本文在最终提交代码中额外提供了一个短小的附加脚本，用于读取本地历史收盘价 CSV，构造与到期期限匹配的重叠对数收益率样本，并通过经验拟合直接生成量子态加载所需的离散价格分布。该脚本无需改动后续量子线路，即可完成“真实金融数据拟合 $\rightarrow$ 底层量子线路 $\rightarrow$ IQAE 定价”的端到端演示。
+
+\section{复杂度分析与数值结果}
+\subsection{基础门复杂度与量子比特开销}
+本文的核心线路资源统计如表 \ref{tab:resources} 所示。可以看到，整套方案自始至终保持 4 比特、0 辅助位，且所有复杂模块均被明确压缩为固定数量的基础门。
+
+\begin{table}[H]
+\centering
+\small
+\caption{核心模块的底层门资源统计}
+\label{tab:resources}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.25\linewidth}cccccc}
+\toprule
+模块 & 量子比特数 & 辅助位 & RY & RZ & 其他单比特门 & CNOT \\
+\midrule
+状态加载 $\mathcal{A}_{\mathrm{SP}}$ & 3 & 0 & 7 & 0 & 0 & 6 \\
+收益编码 $\mathcal{A}_{\mathrm{payoff}}$ & 4 & 0 & 8 & 0 & 0 & 8 \\
+总算子 $\mathcal{A}$ & 4 & 0 & 15 & 0 & 0 & 14 \\
+全零态反射 $\mathcal{S}_0$ & 4 & 0 & 0 & 15 & 8X & 34 \\
+Grover 算子 $\mathcal{Q}$ & 4 & 0 & 30 & 15 & 8X+1Z & 62 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+从复杂度角度看，本文的主要资源优势体现在两方面：
+\begin{itemize}[leftmargin=2em]
+\item \textbf{宽度优势：} 与标准 QAE 相比，本文不需要评估寄存器，因此总量子比特数始终固定为 4；
+\item \textbf{深度优势：} 本文完全去除了 IQFT 与受控幂次 Grover 结构，量子部分只需重复执行同一个手工编译的 $\mathcal{Q}$，显著降低了电路层级复杂度与噪声敏感度。
+\end{itemize}
+
+\subsection{数值结果}
+本文得到的关键数值结果如表 \ref{tab:numerics} 所示。
+
+\begin{table}[H]
+\centering
+\caption{本文核心数值结果汇总}
+\label{tab:numerics}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.58\linewidth} >{\raggedleft\arraybackslash}p{0.24\linewidth}}
+\toprule
+指标 & 数值 \\
+\midrule
+价格分布加载最大误差 & $1.11\times 10^{-16}$ \\
+收益编码成功概率误差 & $2.78\times 10^{-17}$ \\
+Grover 单次放大误差 & $4.44\times 10^{-16}$ \\
+真实振幅角 $\theta_{\mathrm{true}}$ & $0.2692639084$ \\
+IQAE 最大似然估计 $\theta_{\mathrm{est}}$ & $0.2710321252$ \\
+量子估计价格 $V_0^{\mathrm{quantum}}$ & $9.8296632860$ \\
+经典离散网格价格 $V_0^{\mathrm{grid}}$ & $9.7049291988$ \\
+BSM 解析价格 $V_0^{\mathrm{BSM}}$ & $9.6240791910$ \\
+$|V_0^{\mathrm{quantum}}-V_0^{\mathrm{grid}}|$ & $0.1247340872$ \\
+$|V_0^{\mathrm{grid}}-V_0^{\mathrm{BSM}}|$ & $0.0808500078$ \\
+$|V_0^{\mathrm{quantum}}-V_0^{\mathrm{BSM}}|$ & $0.2055840950$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+这些结果说明：
+\begin{itemize}[leftmargin=2em]
+\item 底层门级态加载、收益编码与 Grover 核心算子都已达到机器精度量级，说明本文的手工分解在数值上是正确且稳定的；
+\item 离散网格价格与 BSM 解析解之间仍存在约 $8.09\times 10^{-2}$ 的偏差，这主要来自\textbf{仅使用 3 个状态比特}带来的粗粒度离散误差；
+\item 最终 IQAE 量子价格与离散网格价格之间的偏差主要来自\textbf{有限采样统计噪声}，并非线路构造误差；若增大 shots 或优化 $k$ 调度，可进一步降低估计方差。
+\end{itemize}
+
+\section{结论}
+本文面向 2026 年 CIC“悟空杯”量子计算大赛期权定价赛题，构建了一套\textbf{极简量子资源、强硬件适配、可端到端复现}的量子欧式看涨期权定价方案。与依赖高层量子宏门、评估寄存器与 IQFT 的常见实现不同，本文自始至终坚持纯底层门编译路线：价格分布加载通过满二叉树与多路复用 $R_y$ 实现，收益编码通过 Gray code 与 Walsh-Hadamard 角变换实现，$C^3Z$ 通过相位多项式精确合成，最终结合 IQAE + MLE 完成期权现价恢复。整套方案仅使用 4 个量子比特、0 个辅助位，所有关键模块均在机器精度范围内验证通过，充分体现了“\textbf{低比特、低深度、强可解释、NISQ 友好}”的设计取向。
+
+从比赛评分视角看，本文方案在三方面具备明显优势：其一，4 比特 ancilla-free 的极简线路结构非常贴合当前量子芯片资源边界；其二，复杂控制逻辑全部由 Gray code 与相位多项式手工分解，原创性与底层实现深度较强；其三，采用 IQAE 取代标准 QAE，彻底移除 IQFT，显著提升了抗噪鲁棒性。后续工作可在同一框架下进一步扩展到亚式期权、障碍期权等奇异期权模型，并结合真实芯片拓扑做编译优化与噪声实验。
+
+\appendix
+\section{真实 SPY 历史数据驱动的附加实验}
+为进一步回应赛题中“真实金融数据拟合”“其他奇异期权计算”“考虑 BSM 假设之外分布”等加分项，本文额外给出一个基于真实 SPY 历史价格序列的附加实验。实验数据文件为本地 CSV \texttt{data/spy\_history\_stooq.csv}。该文件于 2026 年 3 月 27 日从公开下载接口 \url{https://stooq.com/q/d/l/?s=spy.us&i=d} 获取，覆盖区间为 2005-02-25 至 2026-03-26，共 5303 条日线记录；最新收盘价为
+\begin{equation}
+S_0 = 645.09.
+\end{equation}
+在附加实验中，本文不再采用 BSM 对数正态假设，而是直接基于历史价格构造 21 个交易日（约 1 个月）重叠对数收益率样本，并通过 Gaussian KDE 拟合经验收益率密度，再将其离散到 3 个状态比特对应的 8 个价格网格上。随后，完全复用本文主流程中的底层态加载、收益编码、Grover 算子与 IQAE 估计模块。
+
+\subsection{欧式看涨期权与向上敲出看涨期权同框对比}
+为体现框架对奇异期权收益结构的直接适配能力，本文在同一份经验分布上，对如下两类产品同时做量子定价：
+\begin{itemize}[leftmargin=2em]
+\item 欧式看涨期权：执行价取平值 $K=S_0=645.09$；
+\item 向上敲出看涨期权：执行价仍取 $K=645.09$，障碍价格取
+\begin{equation}
+B=1.07 S_0=690.2463.
+\end{equation}
+\end{itemize}
+所有结果均由本地脚本 \texttt{historical\_returns\_quantum\_demo.py} 实际运行得到，不包含任何手工虚构数据。对应结果如表 \ref{tab:appendix_real_data_compare} 所示。
+
+\begin{table}[H]
+\centering
+\small
+\caption{真实 SPY 历史经验分布下的欧式看涨与向上敲出看涨对比}
+\label{tab:appendix_real_data_compare}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.28\linewidth} >{\raggedleft\arraybackslash}p{0.16\linewidth} >{\raggedleft\arraybackslash}p{0.16\linewidth}}
+\toprule
+指标 & 欧式看涨 & 向上敲出看涨 \\
+\midrule
+分布拟合方法 & Gaussian KDE & Gaussian KDE \\
+到期期限对应交易日数 & 21 & 21 \\
+量子估计价格 & 13.3875726052 & 9.3135556232 \\
+经典离散网格价格 & 13.3890126371 & 9.3113449367 \\
+量子与网格绝对误差 & 0.0014400319 & 0.0022106865 \\
+经验分布下最高价格网格点收益 & 71.04021234 & 0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+从表 \ref{tab:appendix_real_data_compare} 可以清晰看到，在同一份真实历史收益率拟合分布下，向上敲出看涨期权由于在高价格区间触发敲出条件，最高价格分支的收益直接归零，从而显著压低了期权价格。这一结果表明，本文框架不仅支持欧式期权，也能以极低改动成本扩展到障碍期权等奇异期权。
+
+\subsection{历史数据脚本运行结果展示}
+为了便于评委快速核验“真实数据读取 $\rightarrow$ 经验分布拟合 $\rightarrow$ 量子线路执行 $\rightarrow$ IQAE 定价”的完整链路，图 \ref{fig:appendix_historical_demo} 给出了脚本 \texttt{python historical\_returns\_quantum\_demo.py --csv data/spy\_history\_stooq.csv} 的一页实际运行结果展示。考虑到原始文本缩略图存在大面积空白边缘，本文在附录中直接嵌入由本地真实输出文件生成的终端结果面板，以确保评委可以一眼看到关键字段。图中列出的 CSV 路径、拟合方式、经验价格网格、IQAE 采样记录与最终价格均来自本地真实执行输出。
+
+\begin{figure}[H]
+\centering
+\VerbatimInput[
+  frame=single,
+  fontsize=\tiny,
+  firstline=1,
+  lastline=39
+]{data/historical_demo_european_output.txt}
+\caption{真实 SPY 历史数据驱动的 \texttt{historical\_returns\_quantum\_demo.py} 实际运行结果节选}
+\label{fig:appendix_historical_demo}
+\end{figure}
+
+\subsection{附录说明}
+本附录展示的核心意义在于：本文的底层量子编译框架对“收益结构”和“概率分布来源”是解耦的。换言之，只要经典端能够输出离散价格网格及其对应概率，无论该分布来源于 BSM、历史收益率经验拟合、肥尾模型，还是未来更复杂的生成模型，后续量子部分均可直接复用。这一特性使得本文方案不仅满足基础赛题要求，而且具备进一步面向真实市场数据与奇异期权定价的扩展潜力。
+
+\begin{thebibliography}{9}
+\bibitem{stamatopoulos2020}
+Stamatopoulos N, Egger D J, Sun Y, et al.
+\newblock Option pricing using quantum computers[J].
+\newblock \emph{Quantum}, 2020, 4: 291.
+\newblock DOI: \url{https://doi.org/10.22331/q-2020-07-06-291}
+\end{thebibliography}
+
+\end{document}

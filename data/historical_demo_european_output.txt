@@ -1,0 +1,45 @@
+========================================================================
+历史收益率拟合驱动的量子期权定价演示
+========================================================================
+CSV file:
+data/spy_history_stooq.csv
+Latest close used as default S0:
+645.09
+Detected fit method:
+gaussian-kde
+Horizon steps used for return fitting:
+21
+Option type:
+European Call
+
+Empirical price grid:
+[552.50495996 575.87999601 599.25503207 622.63006812 646.00510418
+ 669.38014023 692.75517629 716.13021234]
+Empirical probabilities:
+[0.00371315 0.01497351 0.0487701  0.13842174 0.34300676 0.37199466
+ 0.06529387 0.01382619]
+Payoff list:
+[ 0.          0.          0.          0.          0.91510418 24.29014023
+ 47.66517629 71.04021234]
+
+IQAE records:
+{'k': 0, 'shots': 1000, 'successes': 107, 'exact_probability': 0.09462351497975637, 'sample_frequency': 0.107}
+{'k': 1, 'shots': 1000, 'successes': 673, 'exact_probability': 0.6502805569010679, 'sample_frequency': 0.673}
+{'k': 2, 'shots': 1000, 'successes': 1000, 'exact_probability': 0.9999452613493114, 'sample_frequency': 1.0}
+{'k': 4, 'shots': 1000, 'successes': 108, 'exact_probability': 0.10346189783093572, 'sample_frequency': 0.108}
+{'k': 8, 'shots': 1000, 'successes': 681, 'exact_probability': 0.678227039330011, 'sample_frequency': 0.681}
+
+Estimated theta:
+0.31266215482113113
+Quantum Price (historical-fit distribution):
+13.387572605229066
+Classical Grid Price (same empirical distribution):
+13.389012637082633
+Absolute difference vs classical grid price:
+0.0014400318535674472
+Reference BSM analytic price:
+12.416794490642474
+Absolute difference vs BSM analytic price:
+0.9707781145865919
+MLE method:
+scipy-bounded-mle
